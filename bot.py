@@ -1,7 +1,7 @@
 """
 Telegram-бот для автопубликации новостей об ИИ.
 Запускается по расписанию через GitHub Actions:
-парсит RSS → обрабатывает через Claude → постит одну новость → завершается.
+парсит RSS → Claude выбирает лучшую новость → переписывает её цепляюще → постит.
 """
 
 import os
@@ -26,18 +26,18 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # RSS-источники новостей про ИИ
 RSS_SOURCES = [
-    # Англоязычные топ-источники
     ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
     ("The Verge AI", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
     ("VentureBeat AI", "https://venturebeat.com/category/ai/feed/"),
     ("MIT Technology Review AI", "https://www.technologyreview.com/topic/artificial-intelligence/feed"),
     ("Ars Technica AI", "https://arstechnica.com/ai/feed/"),
-    # Русскоязычные
     ("Хабр ИИ", "https://habr.com/ru/rss/hub/artificial_intelligence/all/?fl=ru"),
     ("Хабр Машинное обучение", "https://habr.com/ru/rss/hub/machine_learning/all/?fl=ru"),
 ]
 
-# Файл с историей опубликованных новостей (хранится в репозитории)
+# Сколько новостей показать Claude для выбора лучшей
+NEWS_POOL_SIZE = 20
+
 POSTED_FILE = Path("posted_news.json")
 
 logging.basicConfig(
@@ -65,7 +65,6 @@ def load_posted_ids() -> set:
 def save_posted_id(news_id: str) -> None:
     ids = load_posted_ids()
     ids.add(news_id)
-    # Храним только последние 1000 ID
     ids_list = list(ids)[-1000:]
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump({"ids": ids_list}, f, ensure_ascii=False, indent=2)
@@ -122,44 +121,136 @@ def fetch_news() -> list[dict]:
 
 
 # ============================================================
-# ОБРАБОТКА ЧЕРЕЗ CLAUDE
+# ВЫБОР ЛУЧШЕЙ НОВОСТИ ЧЕРЕЗ CLAUDE
 # ============================================================
 
-SYSTEM_PROMPT = """Ты — редактор популярного Telegram-канала про искусственный интеллект на русском языке.
+SELECTOR_PROMPT = """Ты — главный редактор крутого Telegram-канала про ИИ. Твоя задача — из списка новостей выбрать ОДНУ самую интересную для русскоязычной аудитории.
 
-Твоя задача — переписать новость или статью так, чтобы она цепляла читателя и была написана живым языком. Никакого канцелярита и сухих официальных формулировок.
+КРИТЕРИИ ОЦЕНКИ (по важности):
+1. Реальное событие, а не маркетинговая хрень. Запуски моделей > обновления функций > слухи > мнения.
+2. Влияние на индустрию или жизнь людей. Прорывы > улучшения > мелочи.
+3. Уникальность темы. Новые имена/исследования > 100500-я статья про ChatGPT.
+4. Практическая польза или яркий wow-эффект.
 
-ПРАВИЛА ОФОРМЛЕНИЯ:
-1. Цепляющий заголовок жирным шрифтом (используй <b>текст</b>) — без эмодзи в начале
-2. Основной текст — 3-5 коротких абзацев, разделённых пустой строкой
-3. Используй 2-4 эмодзи по тексту, но не перебарщивай
-4. В конце — короткий вывод или провокационный вопрос для обсуждения
-5. Максимум 800 символов в основном тексте (Telegram-формат)
-6. Пиши на русском языке, даже если исходник на английском
+ИЗБЕГАЙ:
+- Чисто корпоративных новостей (поглощения, инвестиции без продукта) — кроме реально крупных
+- Дублирующих тем, которые недавно муссировались всеми
+- Длинных аналитических лонгридов без явного инфоповода
 
-СТИЛЬ:
-- Простые слова, без жаргона
-- Объясняй технические термины
-- Если новость про продукт — пиши, зачем это нужно простому человеку
-- Если про исследование — объясняй практическую пользу
-- Никаких "В современном мире...", "Стоит отметить...", "Важно понимать..."
+Тебе на вход даётся список новостей в формате:
+[номер] (источник) Заголовок
+Краткое описание...
 
-ФОРМАТ HTML (Telegram поддерживает только эти теги):
-- <b>жирный</b>
-- <i>курсив</i>
-- <code>код</code>
-- НЕ используй другие HTML-теги
+ОТВЕТЬ ТОЛЬКО ОДНОЙ ЦИФРОЙ — номером самой интересной новости. Без объяснений, без текста, без точек. Просто число."""
 
-Не добавляй ссылку на источник — она будет добавлена автоматически.
-Не добавляй хэштеги — они будут добавлены автоматически.
-Не пиши "Новость:" или "Источник:" — сразу с заголовка.
-"""
+
+def select_best_news(news_list: list[dict]) -> dict | None:
+    """Claude выбирает самую интересную новость из списка."""
+    if not news_list:
+        return None
+
+    # Если новость только одна — без выбора
+    if len(news_list) == 1:
+        logger.info("📌 Новость одна, выбор не нужен")
+        return news_list[0]
+
+    try:
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        # Формируем список для Claude
+        candidates_text = "\n\n".join([
+            f"[{i + 1}] ({news['source']}) {news['title']}\n"
+            f"{news['summary'][:400]}"
+            for i, news in enumerate(news_list)
+        ])
+
+        logger.info(f"🤔 Claude выбирает лучшую из {len(news_list)} новостей...")
+
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            system=SELECTOR_PROMPT,
+            messages=[{"role": "user", "content": candidates_text}],
+        )
+
+        answer = response.content[0].text.strip()
+        # Достаём число из ответа (на случай если Claude добавил лишнее)
+        digits = "".join(c for c in answer if c.isdigit())
+        if not digits:
+            logger.warning(f"⚠️ Claude вернул некорректный выбор: '{answer}', беру первую")
+            return news_list[0]
+
+        index = int(digits) - 1
+        if index < 0 or index >= len(news_list):
+            logger.warning(f"⚠️ Claude вернул выход за диапазон: {index + 1}, беру первую")
+            return news_list[0]
+
+        chosen = news_list[index]
+        logger.info(f"✅ Выбрана #{index + 1}: {chosen['title'][:60]}...")
+        return chosen
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка при выборе новости: {e}, беру первую")
+        return news_list[0]
+
+
+# ============================================================
+# НАПИСАНИЕ ПОСТА ЧЕРЕЗ CLAUDE
+# ============================================================
+
+WRITER_PROMPT = """Ты — топовый автор Telegram-канала про ИИ. Твои посты лайкают и пересылают. Твоя задача — превратить новость в КОРОТКИЙ цепляющий пост.
+
+ФОРМАТ ПОСТА (строго в таком порядке):
+
+1. КРЮК — первая строка. Это вопрос, интригующая фраза или яркое утверждение. Цель — заставить остановить скролл. БЕЗ эмодзи в начале.
+
+2. <b>Заголовок жирным</b> — короткий, не длиннее 8 слов. Без эмодзи.
+
+3. СУТЬ — 2-3 коротких предложения. ЧТО произошло. Без воды, без преамбул.
+
+4. ПОЧЕМУ ЭТО ВАЖНО — 1-2 предложения. Зачем читателю это знать. Что это меняет. Какие будут последствия.
+
+5. ФИНАЛЬНАЯ ФРАЗА — короткая мысль, провокация или вопрос. Чтобы хотелось поставить эмодзи или написать в комменты.
+
+ЖЁСТКИЕ ОГРАНИЧЕНИЯ:
+- ВЕСЬ пост — максимум 500 символов. Чем короче, тем лучше.
+- Не больше 3 эмодзи во всём посте. Они для акцентов, а не для украшения.
+- Короткие предложения. Если можешь сократить — сократи.
+- Пустые строки между блоками для воздуха.
+
+ЗАПРЕЩЕНО:
+❌ "В современном мире..."
+❌ "Стоит отметить, что..."
+❌ "Важно понимать..."
+❌ "Эксперты считают..."
+❌ "Не за горами тот день..."
+❌ Канцелярит. Сложные слова. Длинные предложения.
+❌ Пересказ всей статьи. Тебе нужна СУТЬ.
+
+ХОРОШИЕ КРЮКИ (примеры):
+✅ "OpenAI снова сделала это."
+✅ "Кажется, программистам пора нервничать."
+✅ "Это изменит то, как мы общаемся с ИИ."
+✅ "Думаешь, такое возможно? Уже да."
+
+ПЛОХИЕ КРЮКИ:
+❌ "Сегодня мы расскажем..."
+❌ "В мире искусственного интеллекта произошло важное событие..."
+❌ "Компания X объявила о выпуске..."
+
+HTML-ТЕГИ (только эти):
+<b>жирный</b> — для заголовка и редких акцентов
+<i>курсив</i> — для редких выделений
+НЕ используй другие теги.
+
+Не добавляй "Источник:", "Ссылка:", хэштеги — это всё добавится автоматически.
+Пиши на русском, всегда, даже если исходник на английском."""
 
 
 def rewrite_news_with_claude(news: dict) -> str | None:
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
-        user_message = f"""Перепиши эту новость для Telegram-канала про ИИ:
+        user_message = f"""Напиши цепляющий короткий пост по этой новости:
 
 Заголовок: {news['title']}
 
@@ -169,13 +260,13 @@ def rewrite_news_with_claude(news: dict) -> str | None:
 
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
+            max_tokens=800,
+            system=WRITER_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
 
         text = response.content[0].text.strip()
-        logger.info(f"✏️ Claude обработал, длина: {len(text)} символов")
+        logger.info(f"✏️ Пост написан, длина: {len(text)} символов")
         return text
 
     except Exception as e:
@@ -215,7 +306,6 @@ async def publish_to_telegram(text: str, source_url: str, source_name: str) -> b
 # ============================================================
 
 async def main() -> None:
-    # Проверка ключей
     missing = []
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
@@ -229,29 +319,38 @@ async def main() -> None:
 
     logger.info("🚀 Начинаю цикл публикации")
 
+    # 1. Парсим RSS
     news_list = fetch_news()
     if not news_list:
-        logger.warning("⚠️ Нет свежих новостей для публикации")
+        logger.warning("⚠️ Нет свежих новостей")
         return
 
-    # Берём первую необработанную новость
-    for news in news_list:
-        rewritten = rewrite_news_with_claude(news)
-        if not rewritten:
-            continue
+    # 2. Оставляем топ-N для выбора (свежие в начале)
+    candidates = news_list[:NEWS_POOL_SIZE]
+    logger.info(f"🎯 Кандидатов на публикацию: {len(candidates)}")
 
-        success = await publish_to_telegram(
-            text=rewritten,
-            source_url=news["url"],
-            source_name=news["source"],
-        )
+    # 3. Claude выбирает лучшую
+    best = select_best_news(candidates)
+    if not best:
+        logger.warning("⚠️ Не удалось выбрать новость")
+        return
 
-        if success:
-            save_posted_id(news["id"])
-            logger.info(f"✅ Опубликовано: {news['title'][:60]}...")
-            return
+    # 4. Claude пишет пост
+    post_text = rewrite_news_with_claude(best)
+    if not post_text:
+        logger.error("❌ Не удалось написать пост")
+        return
 
-    logger.warning("❌ Не удалось опубликовать ни одной новости")
+    # 5. Публикуем
+    success = await publish_to_telegram(
+        text=post_text,
+        source_url=best["url"],
+        source_name=best["source"],
+    )
+
+    if success:
+        save_posted_id(best["id"])
+        logger.info(f"🎉 Готово: {best['title'][:60]}...")
 
 
 if __name__ == "__main__":
