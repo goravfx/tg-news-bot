@@ -1,25 +1,20 @@
-name: Publish AI News
+name: Publish AI Post
 
-# Когда запускать
 on:
   schedule:
-    # ВРЕМЯ ВАЖНО: GitHub Actions работает по UTC
-    # МСК = UTC + 3 часа
-    # 09:00 МСК = 06:00 UTC
-    # 14:00 МСК = 11:00 UTC
-    # 19:00 МСК = 16:00 UTC
-    - cron: '0 6 * * *'   # 09:00 МСК
-    - cron: '0 11 * * *'  # 14:00 МСК
-    - cron: '0 16 * * *'  # 19:00 МСК
+    # 19:00 МСК = 16:00 UTC — один пост в день
+    - cron: '0 16 * * *'
 
-  # Можно также запускать вручную из вкладки Actions
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # нужно чтобы коммитить файл с историей
+      contents: write
 
     steps:
       - name: Получить код
@@ -42,10 +37,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python bot.py
 
-      - name: Сохранить историю в репозиторий
+      - name: Сохранить историю
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add posted_news.json || true
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update posted news history [skip ci]"
+          git add posted_news.json used_topics.json || true
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update history [skip ci]"
           git push || true
