@@ -13,5 +13,8 @@
   ],
   "learning": [
     "02_reddit_stablediffusion.md"
+  ],
+  "production": [
+    "03_full_clip_pipeline.md"
   ]
 }
