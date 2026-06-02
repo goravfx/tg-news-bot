@@ -12,7 +12,8 @@
     "04_suno.md"
   ],
   "lifehacks": [
-    "01_suno_formula.md"
+    "01_suno_formula.md",
+    "02_elevenlabs_stability.md"
   ],
   "learning": [
     "02_reddit_stablediffusion.md"
