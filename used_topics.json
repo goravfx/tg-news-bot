@@ -16,7 +16,8 @@
     "02_elevenlabs_stability.md"
   ],
   "learning": [
-    "02_reddit_stablediffusion.md"
+    "02_reddit_stablediffusion.md",
+    "01_elevenlabs_docs.md"
   ],
   "production": [
     "03_full_clip_pipeline.md"
