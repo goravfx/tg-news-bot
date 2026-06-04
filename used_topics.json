@@ -20,6 +20,7 @@
     "01_elevenlabs_docs.md"
   ],
   "production": [
-    "03_full_clip_pipeline.md"
+    "03_full_clip_pipeline.md",
+    "01_character_pipeline.md"
   ]
 }
