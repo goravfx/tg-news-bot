@@ -1,7 +1,8 @@
 {
   "prompts": [
     "02_cinematic_suno.md",
-    "01_cinematic_portrait.md"
+    "01_cinematic_portrait.md",
+    "03_kling_tracking_shot.md"
   ],
   "hidden": [
     "01_hedra.md",
