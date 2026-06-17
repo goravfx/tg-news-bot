@@ -26,7 +26,8 @@
   "learning": [
     "02_reddit_stablediffusion.md",
     "01_elevenlabs_docs.md",
-    "03_huggingface_blog.md"
+    "03_huggingface_blog.md",
+    "05_hookgenius_suno_guide.md"
   ],
   "production": [
     "03_full_clip_pipeline.md",
