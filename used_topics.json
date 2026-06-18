@@ -32,6 +32,7 @@
   "production": [
     "03_full_clip_pipeline.md",
     "01_character_pipeline.md",
-    "02_lipsync_workflow.md"
+    "02_lipsync_workflow.md",
+    "04_storyboard.md"
   ]
 }
