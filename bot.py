@@ -1,561 +1,501 @@
 """
-Telegram-бот для AI-канала.
-Каждый день недели — своя рубрика.
-Пн-Чт, Сб, Вс — берёт тему из базы знаний (папка content/) и красиво оформляет.
-Пт — публикует лучшую новость недели из расширенного списка источников.
+Telegram-бот для AI-канала (версия 5).
+Чередует свежие новости и рубрики из базы знаний.
+Новости берутся из быстрых источников (Reddit + спец-сайты),
+фильтруются по свежести и переписываются в стиле эксперта с мнением.
 """
-
+ 
 import os
 import json
+import time
 import random
 import logging
 import hashlib
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
+ 
 import feedparser
+import urllib.request
 from anthropic import Anthropic
 from telegram import Bot
 from telegram.constants import ParseMode
-
+ 
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-
+ 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
-# Часовой пояс для определения дня недели
+ 
 TIMEZONE = ZoneInfo("Europe/Moscow")
-
-# Карта рубрик по дням недели (0=Пн, 1=Вт, ..., 6=Вс)
-WEEKDAY_TOPICS = {
-    0: "tools",       # Пн — Инструмент недели
-    1: "lifehacks",   # Вт — Лайфхак
-    2: "learning",    # Ср — Ресурс для обучения
-    3: "production",  # Чт — Производство контента
-    4: "news",        # Пт — Новость недели
-    5: "prompts",     # Сб — Промпт дня
-    6: "hidden",      # Вс — Малоизвестная нейронка
-}
-
-TOPIC_TITLES = {
-    "tools": "🛠️ Инструмент недели",
-    "lifehacks": "💡 Лайфхак дня",
-    "learning": "📚 Учимся работать с ИИ",
-    "production": "🎬 Производство AI-контента",
-    "news": "🔥 Главная новость недели",
-    "prompts": "✨ Промпт дня",
-    "hidden": "🤖 Скрытая нейронка",
-}
-
-# RSS-источники для пятничных новостей
-# Расширенный список с фокусом на инструменты создателей контента
+ 
+# Чередование: чётные дни месяца — НОВОСТИ, нечётные — РУБРИКА из базы.
+# (можно поменять логику ниже в main)
+ 
+# ----- ИСТОЧНИКИ НОВОСТЕЙ (быстрые, специализированные) -----
+# Reddit — новости появляются в день релиза.
+# Топ за неделю = только то, что реально завирусилось.
 RSS_SOURCES = [
-    # Основные tech-источники про ИИ
-    ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
-    ("The Verge AI", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
+    # Reddit — генеративный контент (САМЫЕ БЫСТРЫЕ)
+    ("r/aivideo", "https://www.reddit.com/r/aivideo/top/.rss?t=week"),
+    ("r/StableDiffusion", "https://www.reddit.com/r/StableDiffusion/top/.rss?t=week"),
+    ("r/SunoAI", "https://www.reddit.com/r/SunoAI/top/.rss?t=week"),
+    ("r/singularity", "https://www.reddit.com/r/singularity/top/.rss?t=week"),
+    ("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week"),
+    ("r/artificial", "https://www.reddit.com/r/artificial/top/.rss?t=week"),
+    ("r/midjourney", "https://www.reddit.com/r/midjourney/top/.rss?t=week"),
+    # Спец-сайты про AI-инструменты
     ("VentureBeat AI", "https://venturebeat.com/category/ai/feed/"),
+    ("The Verge AI", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
+    ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
     ("Ars Technica AI", "https://arstechnica.com/ai/feed/"),
-    # Hugging Face — много про новые модели
-    ("Hugging Face Blog", "https://huggingface.co/blog/feed.xml"),
-    # Reddit — фокус на генеративный контент
-    ("Reddit StableDiffusion", "https://www.reddit.com/r/StableDiffusion/top/.rss?t=week"),
-    ("Reddit SunoAI", "https://www.reddit.com/r/SunoAI/top/.rss?t=week"),
-    ("Reddit aivideo", "https://www.reddit.com/r/aivideo/top/.rss?t=week"),
-    ("Reddit ChatGPT", "https://www.reddit.com/r/ChatGPT/top/.rss?t=week"),
-    # Русскоязычные
-    ("Хабр ИИ", "https://habr.com/ru/rss/hub/artificial_intelligence/all/?fl=ru"),
-    ("Хабр Машинное обучение", "https://habr.com/ru/rss/hub/machine_learning/all/?fl=ru"),
+    ("Hugging Face", "https://huggingface.co/blog/feed.xml"),
 ]
-
-# Сколько новостей передавать Claude для выбора лучшей
-NEWS_POOL_SIZE = 25
-
-# Папка с базой знаний (контент для рубрик)
+ 
+# Окно свежести: берём только новости за последние N дней
+FRESHNESS_DAYS = 4
+ 
+# Сколько новостей даём Claude для выбора лучшей
+NEWS_POOL_SIZE = 30
+ 
+# Папки
 CONTENT_DIR = Path("content")
 POSTED_FILE = Path("posted_news.json")
 USED_TOPICS_FILE = Path("used_topics.json")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+ 
+# Рубрики из базы знаний (для дней-рубрик)
+TOPIC_ROTATION = ["tools", "lifehacks", "learning", "production", "prompts", "hidden"]
+TOPIC_TITLES = {
+    "tools": "🛠️ Инструмент",
+    "lifehacks": "💡 Лайфхак",
+    "learning": "📚 Учимся работать с ИИ",
+    "production": "🎬 Производство AI-контента",
+    "prompts": "✨ Промпт дня",
+    "hidden": "🤖 Скрытая нейронка",
+}
+ 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-
+ 
+ 
 # ============================================================
-# ИСТОРИЯ ПУБЛИКАЦИЙ
+# ИСТОРИЯ
 # ============================================================
-
-def load_posted_ids() -> set:
-    if POSTED_FILE.exists():
+ 
+def load_json(path: Path, default):
+    if path.exists():
         try:
-            with open(POSTED_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f).get("ids", []))
-        except Exception as e:
-            logger.warning(f"Не удалось загрузить историю новостей: {e}")
-    return set()
-
-
-def save_posted_id(news_id: str) -> None:
-    ids = load_posted_ids()
-    ids.add(news_id)
-    ids_list = list(ids)[-1000:]
-    with open(POSTED_FILE, "w", encoding="utf-8") as f:
-        json.dump({"ids": ids_list}, f, ensure_ascii=False, indent=2)
-
-
-def load_used_topics() -> dict:
-    """Хранит, какие темы из базы знаний уже публиковались."""
-    if USED_TOPICS_FILE.exists():
-        try:
-            with open(USED_TOPICS_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"Не удалось загрузить used_topics: {e}")
-    return {}
-
-
-def save_used_topic(topic_type: str, filename: str) -> None:
-    used = load_used_topics()
-    if topic_type not in used:
-        used[topic_type] = []
-    used[topic_type].append(filename)
-    # Храним последние 50 использованных тем по каждой рубрике
-    used[topic_type] = used[topic_type][-50:]
-    with open(USED_TOPICS_FILE, "w", encoding="utf-8") as f:
-        json.dump(used, f, ensure_ascii=False, indent=2)
-
-
+            logger.warning(f"Не удалось прочитать {path}: {e}")
+    return default
+ 
+ 
+def save_json(path: Path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+ 
+ 
+def load_posted_ids() -> set:
+    return set(load_json(POSTED_FILE, {"ids": []}).get("ids", []))
+ 
+ 
+def save_posted_id(news_id: str):
+    ids = load_posted_ids()
+    ids.add(news_id)
+    save_json(POSTED_FILE, {"ids": list(ids)[-1000:]})
+ 
+ 
 def make_news_id(url: str) -> str:
     return hashlib.md5(url.encode("utf-8")).hexdigest()[:16]
-
-
+ 
+ 
 # ============================================================
-# РАБОТА С БАЗОЙ ЗНАНИЙ
+# ПАРСИНГ С ФИЛЬТРОМ СВЕЖЕСТИ
 # ============================================================
-
-def get_topic_from_knowledge_base(topic_type: str) -> dict | None:
-    """Выбирает неиспользованную тему из соответствующей папки."""
-    topic_dir = CONTENT_DIR / topic_type
-    if not topic_dir.exists():
-        logger.error(f"❌ Папка {topic_dir} не существует")
-        return None
-
-    # Все .md файлы в папке рубрики
-    all_files = sorted([f for f in topic_dir.glob("*.md") if f.is_file()])
-    if not all_files:
-        logger.error(f"❌ В папке {topic_dir} нет файлов с темами")
-        return None
-
-    # Исключаем уже использованные
-    used = load_used_topics().get(topic_type, [])
-    available = [f for f in all_files if f.name not in used]
-
-    # Если все темы прошли — начинаем по новой
-    if not available:
-        logger.info(f"♻️ Все темы {topic_type} уже использованы, начинаю круг заново")
-        # Чистим историю по этой рубрике, чтоб можно было использовать снова
-        used_data = load_used_topics()
-        used_data[topic_type] = []
-        with open(USED_TOPICS_FILE, "w", encoding="utf-8") as f:
-            json.dump(used_data, f, ensure_ascii=False, indent=2)
-        available = all_files
-
-    # Берём случайную из доступных
-    chosen_file = random.choice(available)
-    logger.info(f"📂 Выбрана тема: {chosen_file.name}")
-
+ 
+def fetch_feed_with_ua(url: str):
+    """Парсит RSS с User-Agent (нужно для Reddit, иначе блок)."""
     try:
-        with open(chosen_file, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        return {
-            "type": topic_type,
-            "filename": chosen_file.name,
-            "content": content,
-        }
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TelegramAINewsBot/1.0"
+        })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        return feedparser.parse(data)
     except Exception as e:
-        logger.error(f"❌ Не удалось прочитать {chosen_file}: {e}")
-        return None
-
-
-# ============================================================
-# ПРОМПТЫ ДЛЯ ОФОРМЛЕНИЯ ПОСТОВ ПО РУБРИКАМ
-# ============================================================
-
-WRITER_BASE = """Ты — автор Telegram-канала для создателей AI-контента. Аудитория — люди, которые сами делают видео и арт через нейронки (Suno, Runway, Kling, ChatGPT, ElevenLabs и т.д.). Они не новички, но всегда ищут новые приёмы и инструменты.
-
-ТВОЯ ЗАДАЧА — оформить материал в короткий цепляющий пост.
-
-ОБЩИЕ ПРАВИЛА:
-- Пиши на русском
-- Короткие предложения, без воды
-- Максимум 600 символов в основном тексте
-- 1-3 эмодзи, не больше
-- Никакого канцелярита: "стоит отметить", "в современном мире", "важно понимать" — ЗАПРЕЩЕНО
-- Начинай с крюка — фразы, которая заставит остановиться
-
-HTML-ТЕГИ (только эти):
-<b>жирный</b>
-<i>курсив</i>
-<code>код</code>
-НИКАКИХ других тегов.
-
-Не добавляй "Источник:", "Автор:", хэштеги — это всё добавится автоматически."""
-
-
-PROMPTS_BY_TOPIC = {
-    "tools": WRITER_BASE + """
-
-РУБРИКА: ИНСТРУМЕНТ НЕДЕЛИ.
-Тебе дан материал про конкретный AI-инструмент. Расскажи о нём так:
-
-СТРУКТУРА:
-1. Крюк — одно предложение, чем этот инструмент уникален
-2. <b>Название инструмента</b>
-3. Что он делает (1-2 предложения, по сути)
-4. Главная фишка — за что его стоит попробовать
-5. Кому это нужно (1 предложение)
-6. Финальная мысль или вопрос
-
-Тон: уверенный, как у опытного юзера, который тестит много инструментов.""",
-
-    "lifehacks": WRITER_BASE + """
-
-РУБРИКА: ЛАЙФХАК.
-Тебе дан материал про конкретный приём или фишку. Оформи как готовый рецепт:
-
-СТРУКТУРА:
-1. Крюк — обещание результата ("Хочешь, чтобы X выдавал Y? Вот как.")
-2. <b>Заголовок лайфхака</b> (короткий, конкретный)
-3. Суть приёма — 2-3 предложения, что именно делать
-4. Если есть код/параметр/промпт — выдели через <code>...</code>
-5. Почему это работает (опционально, 1 предложение)
-6. Призыв попробовать
-
-Тон: дружеский, как будто делишься с коллегой.""",
-
-    "learning": WRITER_BASE + """
-
-РУБРИКА: РЕСУРС ДЛЯ ОБУЧЕНИЯ.
-Тебе дан материал про полезный сайт, курс, канал или гайд для AI-творцов.
-
-СТРУКТУРА:
-1. Крюк — почему это стоит изучить
-2. <b>Название ресурса</b>
-3. Что там есть (1-2 предложения, конкретика)
-4. Кому подойдёт и какой уровень
-5. Один яркий пример, что можно вынести
-6. Финальная фраза с рекомендацией
-
-Тон: куратора, который сам прошёл этот ресурс.""",
-
-    "production": WRITER_BASE + """
-
-РУБРИКА: ПРОИЗВОДСТВО AI-КОНТЕНТА.
-Тебе дан материал про конкретный приём, пайплайн или фишку производства AI-видео/арта.
-
-СТРУКТУРА:
-1. Крюк — какой результат даёт этот приём
-2. <b>Название техники</b>
-3. Как это устроено (2-3 предложения, по шагам если возможно)
-4. Какие инструменты задействованы
-5. На что обратить внимание / какая ошибка типичная
-6. Призыв применить
-
-Тон: практика, который сам прошёл через эти грабли.""",
-
-    "prompts": WRITER_BASE + """
-
-РУБРИКА: ПРОМПТ ДНЯ.
-Тебе дан готовый промпт с примером результата.
-
-СТРУКТУРА:
-1. Крюк — какой эффект даёт промпт
-2. <b>Название промпта или для чего он</b>
-3. Сам промпт — обязательно в блоке <code>...</code> (можно многострочный)
-4. Для какой нейронки (Suno / Midjourney / Kling и т.д.)
-5. Что важно знать при использовании (1-2 предложения)
-6. Призыв повторить и поделиться результатом
-
-Можно увеличить длину поста до 800 символов, если промпт длинный.""",
-
-    "hidden": WRITER_BASE + """
-
-РУБРИКА: СКРЫТАЯ НЕЙРОНКА.
-Тебе дан материал про малоизвестный или недооценённый AI-инструмент.
-
-СТРУКТУРА:
-1. Крюк — намёк на то, что эту нейронку мало кто знает, но она крутая
-2. <b>Название инструмента</b>
-3. Что он делает уникального
-4. Чем лучше популярных аналогов
-5. Где найти / как попробовать
-6. Финальная мысль
-
-Тон: открывателя сокровищ.""",
-
-    "news": WRITER_BASE + """
-
-РУБРИКА: ГЛАВНАЯ НОВОСТЬ НЕДЕЛИ.
-Тебе даётся новость про ИИ. Перепиши её ярко и коротко.
-
-СТРУКТУРА:
-1. Крюк — что-то цепляющее, не "сегодня компания X объявила"
-2. <b>Заголовок-суть</b>
-3. Что произошло (2 предложения)
-4. Почему это важно для создателей AI-контента (1-2 предложения)
-5. Финальная провокация или вопрос
-
-Тон: уверенный, без пафоса. Если новость переоценена — скажи это.""",
-}
-
-
-# ============================================================
-# RSS-ПАРСИНГ (для пятничных новостей)
-# ============================================================
-
+        logger.warning(f"UA-парсинг не сработал для {url}: {e}, пробую обычный")
+        try:
+            return feedparser.parse(url)
+        except Exception as e2:
+            logger.error(f"И обычный парсинг упал: {e2}")
+            return None
+ 
+ 
+def entry_age_days(entry) -> float | None:
+    """Возраст записи в днях. None если дату не определить."""
+    for key in ("published_parsed", "updated_parsed"):
+        t = entry.get(key)
+        if t:
+            try:
+                dt = datetime(*t[:6], tzinfo=timezone.utc)
+                return (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+            except Exception:
+                continue
+    return None
+ 
+ 
 def fetch_news() -> list[dict]:
     posted_ids = load_posted_ids()
     all_news = []
-
+ 
     for source_name, rss_url in RSS_SOURCES:
-        try:
-            logger.info(f"Парсим: {source_name}")
-            feed = feedparser.parse(rss_url)
-
-            for entry in feed.entries[:10]:
-                url = entry.get("link", "")
-                if not url:
-                    continue
-
-                news_id = make_news_id(url)
-                if news_id in posted_ids:
-                    continue
-
-                summary = entry.get("summary", "") or entry.get("description", "")
-                summary = (
-                    summary.replace("<p>", "")
-                    .replace("</p>", "\n")
-                    .replace("<br>", "\n")
-                    .replace("<br/>", "\n")
-                )
-
-                all_news.append({
-                    "id": news_id,
-                    "title": entry.get("title", "").strip(),
-                    "summary": summary.strip()[:1500],
-                    "url": url,
-                    "source": source_name,
-                })
-        except Exception as e:
-            logger.error(f"Ошибка при парсинге {source_name}: {e}")
-
-    logger.info(f"📰 Всего свежих новостей: {len(all_news)}")
+        feed = fetch_feed_with_ua(rss_url)
+        if not feed or not feed.entries:
+            logger.info(f"Пусто: {source_name}")
+            continue
+ 
+        logger.info(f"Парсим {source_name}: {len(feed.entries)} записей")
+        for entry in feed.entries[:15]:
+            url = entry.get("link", "")
+            if not url:
+                continue
+ 
+            news_id = make_news_id(url)
+            if news_id in posted_ids:
+                continue
+ 
+            # ФИЛЬТР СВЕЖЕСТИ
+            age = entry_age_days(entry)
+            if age is not None and age > FRESHNESS_DAYS:
+                continue  # слишком старое
+ 
+            summary = entry.get("summary", "") or entry.get("description", "")
+            for tag in ["<p>", "</p>", "<br>", "<br/>", "<div>", "</div>", "<span>", "</span>"]:
+                summary = summary.replace(tag, " ")
+ 
+            title = entry.get("title", "").strip()
+            # Reddit-заголовки часто содержат флейр в скобках — оставляем как есть
+ 
+            all_news.append({
+                "id": news_id,
+                "title": title,
+                "summary": summary.strip()[:1200],
+                "url": url,
+                "source": source_name,
+                "age_days": round(age, 1) if age is not None else None,
+            })
+ 
+    logger.info(f"📰 Свежих новостей (до {FRESHNESS_DAYS} дн.): {len(all_news)}")
     return all_news
-
-
+ 
+ 
 # ============================================================
-# ВЫБОР ЛУЧШЕЙ НОВОСТИ (для пятницы)
+# ВЫБОР ЛУЧШЕЙ НОВОСТИ
 # ============================================================
-
-NEWS_SELECTOR_PROMPT = """Ты — главред крутого Telegram-канала для создателей AI-контента (видео, арт, музыка, тексты).
-Твоя аудитория — практики, которые работают с Suno, Runway, Kling, ChatGPT, ElevenLabs, Stable Diffusion и подобными инструментами.
-
-Из списка новостей выбери ОДНУ — самую интересную для этой аудитории за неделю.
-
-ВЫСОКИЙ ПРИОРИТЕТ (нужно):
-- Релизы новых генеративных моделей (видео, аудио, изображения)
-- Большие обновления инструментов, которыми пользуются креаторы
-- Новые возможности для AI-производства контента
-- Прорывы в lipsync, motion, voice cloning
-- Малоизвестные мощные инструменты, которые стоит знать
-
+ 
+NEWS_SELECTOR_PROMPT = """Ты — главред топового русскоязычного Telegram-канала для AI-креаторов (делают видео, музыку, арт через нейросети).
+Аудитория — практики: работают с Seedance, Kling, Veo, Suno, ElevenLabs, Nano Banana, Seedream и т.д.
+ 
+Из списка выбери ОДНУ новость — самую горячую и полезную для этой аудитории ПРЯМО СЕЙЧАС.
+ 
+МАКСИМАЛЬНЫЙ ПРИОРИТЕТ:
+- Релизы и крупные обновления генеративных моделей (видео/аудио/изображения)
+- Новые возможности инструментов создателей контента
+- Прорывы: lipsync, длина видео, разрешение, консистентность, скорость, цена
+- Бенчмарки, где модель обошла конкурентов
+ 
 НИЗКИЙ ПРИОРИТЕТ (избегай):
-- Корпоративные драмы (увольнения, инвестиции без продукта)
-- Слухи и спекуляции
-- 100500-я статья про то же самое
-- Чисто академические работы без практической пользы
-- Регуляторные новости и политика
-
-ОТВЕТЬ ТОЛЬКО ОДНОЙ ЦИФРОЙ — номером лучшей новости. Без объяснений."""
-
-
+- Корпоративные драмы, инвестиции, увольнения
+- Политика, регуляции, этические споры без продукта
+- Чистая наука без практического применения
+- Мутные слухи без конкретики
+ 
+ВАЖНО: если в списке есть свежий релиз модели (Seedance, Kling, Veo, Suno, Nano Banana и подобные) — почти всегда это лучший выбор.
+ 
+Ответь ТОЛЬКО номером лучшей новости. Одна цифра, без пояснений."""
+ 
+ 
 def select_best_news(news_list: list[dict]) -> dict | None:
     if not news_list:
         return None
     if len(news_list) == 1:
         return news_list[0]
-
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
-        candidates_text = "\n\n".join([
-            f"[{i + 1}] ({n['source']}) {n['title']}\n{n['summary'][:400]}"
+        candidates = "\n\n".join([
+            f"[{i+1}] ({n['source']}, {n['age_days']}д назад) {n['title']}\n{n['summary'][:300]}"
             for i, n in enumerate(news_list)
         ])
-
-        logger.info(f"🤔 Claude выбирает лучшую из {len(news_list)} новостей...")
-        response = client.messages.create(
+        resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=10,
             system=NEWS_SELECTOR_PROMPT,
-            messages=[{"role": "user", "content": candidates_text}],
+            messages=[{"role": "user", "content": candidates}],
         )
-
-        answer = response.content[0].text.strip()
+        answer = resp.content[0].text.strip()
         digits = "".join(c for c in answer if c.isdigit())
-        if not digits:
-            return news_list[0]
-
-        index = int(digits) - 1
-        if 0 <= index < len(news_list):
-            chosen = news_list[index]
-            logger.info(f"✅ Выбрана #{index + 1}: {chosen['title'][:60]}...")
-            return chosen
+        if digits:
+            idx = int(digits) - 1
+            if 0 <= idx < len(news_list):
+                chosen = news_list[idx]
+                logger.info(f"✅ Выбрано #{idx+1}: {chosen['title'][:60]}")
+                return chosen
         return news_list[0]
-
     except Exception as e:
-        logger.error(f"❌ Ошибка при выборе новости: {e}")
-        return news_list[0] if news_list else None
-
-
+        logger.error(f"Ошибка выбора: {e}")
+        return news_list[0]
+ 
+ 
 # ============================================================
-# НАПИСАНИЕ ПОСТА
+# НАПИСАНИЕ ПОСТА — НОВОСТЬ (стиль эксперта)
 # ============================================================
-
-def write_post(topic_type: str, material: str, source_info: str = "") -> str | None:
-    """Универсальная функция написания поста под нужную рубрику."""
+ 
+NEWS_WRITER_PROMPT = """Ты — автор крутого Telegram-канала про AI для создателей контента. Твой стиль — живой, экспертный, с мнением. Не пересказчик новостей, а practitioner, который сам в теме и делится находками.
+ 
+ЗАДАЧА: превратить новость в цепляющий пост в стиле топовых AI-каналов.
+ 
+СТРУКТУРА:
+1. ЗАГОЛОВОК жирным с эмодзи в начале — ёмкий, кликбейтный но честный. Примеры: "🚀 Seedance 2.5 — это уже перебор (в хорошем смысле)", "🔥 Kling выкатил Turbo и это меняет правила"
+2. ОДНА вводная строка — почему это важно/круто. Цепляет и держит.
+3. БЛОК "Что нового" — 3-5 пунктов через тире, каждый с <b>ключевым словом</b> жирным. Конкретика: цифры, фичи, отличия от прошлой версии.
+4. ТВОЯ ОЦЕНКА — 1-2 предложения личного экспертного взгляда. Что это значит для практика. Где подвох или где реально прорыв. Будь честным — если фича переоценена, скажи.
+5. ФИНАЛ — короткий вывод, прогноз или вопрос к аудитории.
+ 
+СТИЛЬ:
+- От первого лица, как эксперт: "Я бы сказал...", "На мой взгляд...", "Это тот случай, когда..."
+- Живой язык, лёгкая дерзость, можно сленг ("выкатили", "имба", "перебор", "разрыв")
+- НО без кринжа и без переигрывания
+- Конкретика вместо воды. Цифры, факты, отличия.
+ 
+ЗАПРЕЩЕНО:
+- "Компания X объявила о выпуске" — скучно
+- "В современном мире", "стоит отметить", "важно понимать"
+- Канцелярит и пресс-релизный тон
+- Выдумывать факты которых нет в новости. Если чего-то не знаешь — не пиши.
+ 
+ВАЖНО ПРО ТОЧНОСТЬ:
+Опирайся ТОЛЬКО на факты из новости. Не добавляй характеристики, цифры, даты, которых нет в исходнике. Лучше меньше деталей, но правда.
+ 
+ДЛИНА: до 900 символов.
+ 
+HTML: только <b>жирный</b>, <i>курсив</i>, <code>код</code>. Других тегов нет.
+ 
+Не добавляй "Источник:" и хэштеги — добавится автоматически."""
+ 
+ 
+def write_news_post(news: dict) -> str | None:
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
-        system_prompt = PROMPTS_BY_TOPIC.get(topic_type, WRITER_BASE)
-
-        user_message = f"Материал для поста:\n\n{material}"
-        if source_info:
-            user_message += f"\n\n(Источник: {source_info})"
-
-        response = client.messages.create(
+        msg = f"""Напиши пост по этой новости.
+ 
+Заголовок: {news['title']}
+Источник: {news['source']}
+Содержание: {news['summary']}
+ 
+Помни: только факты из новости, не выдумывай детали."""
+        resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
+            max_tokens=1200,
+            system=NEWS_WRITER_PROMPT,
+            messages=[{"role": "user", "content": msg}],
         )
-
-        text = response.content[0].text.strip()
-        logger.info(f"✏️ Пост написан, длина: {len(text)} символов")
+        text = resp.content[0].text.strip()
+        logger.info(f"✏️ Новостной пост: {len(text)} символов")
         return text
-
     except Exception as e:
-        logger.error(f"❌ Ошибка Claude API: {e}")
+        logger.error(f"Ошибка написания новости: {e}")
         return None
-
-
+ 
+ 
+# ============================================================
+# РУБРИКИ ИЗ БАЗЫ ЗНАНИЙ
+# ============================================================
+ 
+def get_topic_from_base(topic_type: str) -> dict | None:
+    topic_dir = CONTENT_DIR / topic_type
+    if not topic_dir.exists():
+        logger.error(f"Нет папки {topic_dir}")
+        return None
+    all_files = sorted([f for f in topic_dir.glob("*.md") if f.is_file()])
+    if not all_files:
+        return None
+    used = load_json(USED_TOPICS_FILE, {}).get(topic_type, [])
+    available = [f for f in all_files if f.name not in used]
+    if not available:
+        # круг пройден — сбрасываем
+        used_data = load_json(USED_TOPICS_FILE, {})
+        used_data[topic_type] = []
+        save_json(USED_TOPICS_FILE, used_data)
+        available = all_files
+    chosen = random.choice(available)
+    try:
+        content = chosen.read_text(encoding="utf-8").strip()
+        return {"type": topic_type, "filename": chosen.name, "content": content}
+    except Exception as e:
+        logger.error(f"Не прочитать {chosen}: {e}")
+        return None
+ 
+ 
+def save_used_topic(topic_type: str, filename: str):
+    used = load_json(USED_TOPICS_FILE, {})
+    used.setdefault(topic_type, []).append(filename)
+    used[topic_type] = used[topic_type][-50:]
+    save_json(USED_TOPICS_FILE, used)
+ 
+ 
+TOPIC_WRITER_BASE = """Ты — автор Telegram-канала для AI-креаторов. Аудитория делает видео/арт/музыку через нейросети. Не новички, ищут приёмы и инструменты.
+ 
+Оформи материал в короткий цепляющий пост.
+ 
+ОБЩИЕ ПРАВИЛА:
+- Русский язык, живой тон, лёгкая дерзость
+- Короткие предложения, без воды
+- Максимум 700 символов
+- 1-3 эмодзи
+- Никакого канцелярита: "стоит отметить", "в современном мире" — ЗАПРЕЩЕНО
+- Начинай с крюка
+- НЕ выдумывай факты которых нет в материале
+ 
+HTML: <b>жирный</b>, <i>курсив</i>, <code>код</code>. Других тегов нет.
+Не добавляй "Источник:" и хэштеги — добавится автоматически."""
+ 
+TOPIC_PROMPTS = {
+    "tools": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ИНСТРУМЕНТ. Расскажи про инструмент: крюк → <b>название</b> → что делает → главная фишка → кому нужно → вывод.",
+    "lifehacks": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ЛАЙФХАК. Дай приём как рецепт: крюк-обещание → <b>суть</b> → шаги → если есть код/промпт выдели <code>...</code> → призыв попробовать.",
+    "learning": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ОБУЧЕНИЕ. Расскажи про ресурс: крюк → <b>название</b> → что внутри → кому подойдёт → что вынесешь.",
+    "production": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ПРОИЗВОДСТВО. Опиши технику/пайплайн: крюк → <b>название</b> → как устроено по шагам → инструменты → типичная ошибка → призыв.",
+    "prompts": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ПРОМПТ. Дай готовый промпт: крюк → для чего → сам промпт в <code>...</code> → для какой нейронки → что важно знать. Можно до 900 символов.",
+    "hidden": TOPIC_WRITER_BASE + "\n\nРУБРИКА: СКРЫТАЯ НЕЙРОНКА. Открой малоизвестный инструмент: крюк-интрига → <b>название</b> → что умеет уникального → чем лучше популярных → где найти.",
+}
+ 
+ 
+def write_topic_post(topic_type: str, material: str) -> str | None:
+    try:
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        system = TOPIC_PROMPTS.get(topic_type, TOPIC_WRITER_BASE)
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1100,
+            system=system,
+            messages=[{"role": "user", "content": f"Материал:\n\n{material}"}],
+        )
+        text = resp.content[0].text.strip()
+        logger.info(f"✏️ Рубричный пост: {len(text)} символов")
+        return text
+    except Exception as e:
+        logger.error(f"Ошибка написания рубрики: {e}")
+        return None
+ 
+ 
 # ============================================================
 # ПУБЛИКАЦИЯ
 # ============================================================
-
-async def publish_to_telegram(text: str, rubric_title: str, source_url: str | None = None, source_name: str | None = None) -> bool:
+ 
+async def publish(text: str, rubric_title: str | None,
+                  source_url: str | None, source_name: str | None) -> bool:
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
-        # Префикс с названием рубрики
-        full_text = f"<b>{rubric_title}</b>\n\n{text}"
-
-        # Хэштеги и опциональный источник
-        hashtags = "#нейросети #AI"
-
+        parts = []
+        if rubric_title:
+            parts.append(f"<b>{rubric_title}</b>\n")
+        parts.append(text)
         if source_url and source_name:
-            full_text += f"\n\n🔗 <a href=\"{source_url}\">Источник: {source_name}</a>\n\n{hashtags}"
-        else:
-            full_text += f"\n\n{hashtags}"
-
+            parts.append(f"\n🔗 <a href=\"{source_url}\">{source_name}</a>")
+        parts.append("\n#нейросети #AI #ИИ")
+        full = "\n".join(parts)
+ 
         await bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
-            text=full_text,
+            text=full,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=False,
         )
-        logger.info("✅ Пост опубликован")
+        logger.info("✅ Опубликовано")
         return True
-
     except Exception as e:
-        logger.error(f"❌ Ошибка публикации: {e}")
+        logger.error(f"Ошибка публикации: {e}")
         return False
-
-
+ 
+ 
 # ============================================================
 # ОСНОВНАЯ ЛОГИКА
 # ============================================================
-
-async def main() -> None:
-    missing = []
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_CHANNEL_ID:
-        missing.append("TELEGRAM_CHANNEL_ID")
-    if not ANTHROPIC_API_KEY:
-        missing.append("ANTHROPIC_API_KEY")
-    if missing:
-        logger.error(f"❌ Не заданы секреты: {', '.join(missing)}")
-        raise SystemExit(1)
-
-    # Определяем рубрику по дню недели
-    now = datetime.now(TIMEZONE)
-    weekday = now.weekday()  # 0 = Пн
-    topic_type = WEEKDAY_TOPICS[weekday]
-    rubric_title = TOPIC_TITLES[topic_type]
-
-    logger.info(f"📅 Сегодня {now.strftime('%A')}, рубрика: {topic_type}")
-    logger.info(f"🎯 Готовлю пост: {rubric_title}")
-
-    # ПЯТНИЦА — новости из RSS
-    if topic_type == "news":
-        news_list = fetch_news()
-        if not news_list:
-            logger.warning("⚠️ Нет свежих новостей")
-            return
-
-        candidates = news_list[:NEWS_POOL_SIZE]
-        best = select_best_news(candidates)
-        if not best:
-            logger.warning("⚠️ Не удалось выбрать новость")
-            return
-
-        material = f"Заголовок: {best['title']}\n\nСодержание: {best['summary']}"
-        post_text = write_post("news", material, source_info=best["source"])
-        if not post_text:
-            return
-
-        success = await publish_to_telegram(
-            text=post_text,
-            rubric_title=rubric_title,
-            source_url=best["url"],
-            source_name=best["source"],
-        )
-        if success:
-            save_posted_id(best["id"])
-        return
-
-    # ОСТАЛЬНЫЕ ДНИ — берём тему из базы знаний
-    topic = get_topic_from_knowledge_base(topic_type)
+ 
+async def do_news() -> bool:
+    """Опубликовать свежую новость. Возвращает True если успешно."""
+    news_list = fetch_news()
+    if not news_list:
+        logger.warning("Нет свежих новостей")
+        return False
+    candidates = news_list[:NEWS_POOL_SIZE]
+    best = select_best_news(candidates)
+    if not best:
+        return False
+    text = write_news_post(best)
+    if not text:
+        return False
+    ok = await publish(text, None, best["url"], best["source"])
+    if ok:
+        save_posted_id(best["id"])
+    return ok
+ 
+ 
+async def do_topic() -> bool:
+    """Опубликовать рубрику из базы. Возвращает True если успешно."""
+    # Честная ротация: берём следующую рубрику по счётчику, а не по дню.
+    # Счётчик хранится в used_topics.json под ключом "_rotation_index".
+    used = load_json(USED_TOPICS_FILE, {})
+    idx = used.get("_rotation_index", 0)
+    topic_type = TOPIC_ROTATION[idx % len(TOPIC_ROTATION)]
+    used["_rotation_index"] = (idx + 1) % len(TOPIC_ROTATION)
+    save_json(USED_TOPICS_FILE, used)
+    logger.info(f"Рубрика по ротации: {topic_type}")
+ 
+    topic = get_topic_from_base(topic_type)
     if not topic:
-        logger.error(f"❌ Нет доступных тем в рубрике {topic_type}")
-        return
-
-    post_text = write_post(topic_type, topic["content"])
-    if not post_text:
-        return
-
-    success = await publish_to_telegram(
-        text=post_text,
-        rubric_title=rubric_title,
-    )
-    if success:
+        logger.warning(f"Нет тем в рубрике {topic_type}")
+        return False
+    text = write_topic_post(topic_type, topic["content"])
+    if not text:
+        return False
+    ok = await publish(text, TOPIC_TITLES[topic_type], None, None)
+    if ok:
         save_used_topic(topic_type, topic["filename"])
-
-
+    return ok
+ 
+ 
+async def main():
+    missing = [k for k, v in {
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_CHANNEL_ID": TELEGRAM_CHANNEL_ID,
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+    }.items() if not v]
+    if missing:
+        logger.error(f"Не заданы секреты: {', '.join(missing)}")
+        raise SystemExit(1)
+ 
+    # ЧЕРЕДОВАНИЕ: чётные дни месяца — новости, нечётные — рубрика
+    day = datetime.now(TIMEZONE).day
+    is_news_day = (day % 2 == 0)
+ 
+    logger.info(f"📅 День {day}, режим: {'НОВОСТИ' if is_news_day else 'РУБРИКА'}")
+ 
+    if is_news_day:
+        # Новость, с откатом на рубрику если новостей нет
+        if not await do_news():
+            logger.info("Новостей нет — публикую рубрику вместо них")
+            await do_topic()
+    else:
+        # Рубрика, с откатом на новость если база пуста
+        if not await do_topic():
+            logger.info("База пуста — публикую новость вместо рубрики")
+            await do_news()
+ 
+ 
 if __name__ == "__main__":
     asyncio.run(main())
