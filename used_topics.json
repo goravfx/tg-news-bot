@@ -10,7 +10,8 @@
     "04_suno.md",
     "06_seedream_5.md",
     "01_nano_banana_2.md",
-    "05_elevenlabs.md"
+    "05_elevenlabs.md",
+    "07_seedance_2_5.md"
   ],
   "lifehacks": [
     "01_suno_formula.md",
@@ -31,5 +32,6 @@
     "01_character_pipeline.md",
     "02_lipsync_workflow.md",
     "04_storyboard.md"
-  ]
+  ],
+  "_rotation_index": 1
 }
