@@ -18,7 +18,8 @@
     "02_elevenlabs_stability.md",
     "03_kling_at_tags.md",
     "04_seedance_multimodal.md",
-    "05_nano_banana_consistency.md"
+    "05_nano_banana_consistency.md",
+    "06_elevenlabs_speech_to_speech.md"
   ],
   "learning": [
     "02_reddit_stablediffusion.md",
@@ -33,5 +34,5 @@
     "02_lipsync_workflow.md",
     "04_storyboard.md"
   ],
-  "_rotation_index": 1
+  "_rotation_index": 2
 }
