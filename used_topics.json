@@ -22,10 +22,6 @@
     "06_elevenlabs_speech_to_speech.md"
   ],
   "learning": [
-    "02_reddit_stablediffusion.md",
-    "01_elevenlabs_docs.md",
-    "03_huggingface_blog.md",
-    "05_hookgenius_suno_guide.md",
     "04_olivio_youtube.md"
   ],
   "production": [
@@ -34,5 +30,5 @@
     "02_lipsync_workflow.md",
     "04_storyboard.md"
   ],
-  "_rotation_index": 2
+  "_rotation_index": 3
 }
