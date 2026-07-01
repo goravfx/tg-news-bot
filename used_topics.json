@@ -25,10 +25,7 @@
     "04_olivio_youtube.md"
   ],
   "production": [
-    "03_full_clip_pipeline.md",
-    "01_character_pipeline.md",
-    "02_lipsync_workflow.md",
-    "04_storyboard.md"
+    "02_lipsync_workflow.md"
   ],
-  "_rotation_index": 3
+  "_rotation_index": 4
 }
