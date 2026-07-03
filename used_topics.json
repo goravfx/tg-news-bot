@@ -1,6 +1,7 @@
 {
   "prompts": [
-    "02_cinematic_suno.md"
+    "02_cinematic_suno.md",
+    "01_cinematic_portrait.md"
   ],
   "hidden": [
     "03_dreamina.md"
@@ -27,5 +28,5 @@
   "production": [
     "02_lipsync_workflow.md"
   ],
-  "_rotation_index": 4
+  "_rotation_index": 5
 }
