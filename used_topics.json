@@ -4,7 +4,8 @@
     "01_cinematic_portrait.md"
   ],
   "hidden": [
-    "03_dreamina.md"
+    "03_dreamina.md",
+    "04_krea_ai.md"
   ],
   "tools": [
     "03_kling_3.md",
@@ -28,5 +29,5 @@
   "production": [
     "02_lipsync_workflow.md"
   ],
-  "_rotation_index": 5
+  "_rotation_index": 0
 }
