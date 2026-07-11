@@ -20,10 +20,11 @@
     "04_seedance_multimodal.md"
   ],
   "learning": [
-    "04_olivio_youtube.md"
+    "04_olivio_youtube.md",
+    "01_elevenlabs_docs.md"
   ],
   "production": [
     "02_lipsync_workflow.md"
   ],
-  "_rotation_index": 2
+  "_rotation_index": 3
 }
