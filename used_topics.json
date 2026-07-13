@@ -24,7 +24,8 @@
     "01_elevenlabs_docs.md"
   ],
   "production": [
-    "02_lipsync_workflow.md"
+    "02_lipsync_workflow.md",
+    "04_storyboard.md"
   ],
-  "_rotation_index": 3
+  "_rotation_index": 4
 }
