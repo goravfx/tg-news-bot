@@ -6,7 +6,8 @@
   ],
   "hidden": [
     "03_dreamina.md",
-    "04_krea_ai.md"
+    "04_krea_ai.md",
+    "01_hedra.md"
   ],
   "tools": [
     "03_kling_3.md",
@@ -28,5 +29,5 @@
     "02_lipsync_workflow.md",
     "04_storyboard.md"
   ],
-  "_rotation_index": 5
+  "_rotation_index": 0
 }
