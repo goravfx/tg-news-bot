@@ -1,45 +1,39 @@
 """
-Telegram-бот для AI-канала (версия 5).
-Чередует свежие новости и рубрики из базы знаний.
-Новости берутся из быстрых источников (Reddit + спец-сайты),
-фильтруются по свежести и переписываются в стиле эксперта с мнением.
+Telegram-бот для AI-канала (версия 6).
+Чётные дни — свежая новость из быстрых источников.
+Нечётные дни — пост по теме из topics.txt: бот САМ ищет свежую
+информацию в интернете (web search через Claude API) и пишет пост.
+Больше никакой статичной базы, которая кончается и идёт по кругу.
 """
- 
+
 import os
 import json
-import time
 import random
 import logging
 import hashlib
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
- 
+
 import feedparser
 import urllib.request
 from anthropic import Anthropic
 from telegram import Bot
 from telegram.constants import ParseMode
- 
+
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
- 
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
- 
+
 TIMEZONE = ZoneInfo("Europe/Moscow")
- 
-# Чередование: чётные дни месяца — НОВОСТИ, нечётные — РУБРИКА из базы.
-# (можно поменять логику ниже в main)
- 
-# ----- ИСТОЧНИКИ НОВОСТЕЙ (быстрые, специализированные) -----
-# Reddit — новости появляются в день релиза.
-# Топ за неделю = только то, что реально завирусилось.
+
+# Источники новостей (быстрые)
 RSS_SOURCES = [
-    # Reddit — генеративный контент (САМЫЕ БЫСТРЫЕ)
     ("r/aivideo", "https://www.reddit.com/r/aivideo/top/.rss?t=week"),
     ("r/StableDiffusion", "https://www.reddit.com/r/StableDiffusion/top/.rss?t=week"),
     ("r/SunoAI", "https://www.reddit.com/r/SunoAI/top/.rss?t=week"),
@@ -47,97 +41,87 @@ RSS_SOURCES = [
     ("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week"),
     ("r/artificial", "https://www.reddit.com/r/artificial/top/.rss?t=week"),
     ("r/midjourney", "https://www.reddit.com/r/midjourney/top/.rss?t=week"),
-    # Спец-сайты про AI-инструменты
     ("VentureBeat AI", "https://venturebeat.com/category/ai/feed/"),
     ("The Verge AI", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
     ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
     ("Ars Technica AI", "https://arstechnica.com/ai/feed/"),
     ("Hugging Face", "https://huggingface.co/blog/feed.xml"),
 ]
- 
-# Окно свежести: берём только новости за последние N дней
-FRESHNESS_DAYS = 4
- 
-# Сколько новостей даём Claude для выбора лучшей
-NEWS_POOL_SIZE = 30
- 
-# Папки
-CONTENT_DIR = Path("content")
+
+FRESHNESS_DAYS = 4        # окно свежести новостей
+NEWS_POOL_SIZE = 30       # сколько кандидатов даём селектору
+RECENT_TITLES_MEMORY = 15 # сколько последних тем помним для анти-повторов
+WEB_SEARCH_MAX_USES = 4   # лимит поисков на один пост (контроль расходов)
+
+TOPICS_FILE = Path("topics.txt")
 POSTED_FILE = Path("posted_news.json")
 USED_TOPICS_FILE = Path("used_topics.json")
- 
-# Рубрики из базы знаний (для дней-рубрик)
-TOPIC_ROTATION = ["tools", "lifehacks", "learning", "production", "prompts", "hidden"]
-TOPIC_TITLES = {
-    "tools": "🛠️ Инструмент",
-    "lifehacks": "💡 Лайфхак",
-    "learning": "📚 Учимся работать с ИИ",
-    "production": "🎬 Производство AI-контента",
-    "prompts": "✨ Промпт дня",
-    "hidden": "🤖 Скрытая нейронка",
-}
- 
+
+MODEL = "claude-haiku-4-5-20251001"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
- 
- 
+
+
 # ============================================================
-# ИСТОРИЯ
+# ХРАНИЛИЩЕ
 # ============================================================
- 
+
 def load_json(path: Path, default):
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"Не удалось прочитать {path}: {e}")
+            logger.warning(f"Не прочитать {path}: {e}")
     return default
- 
- 
+
+
 def save_json(path: Path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
- 
- 
-def load_posted_ids() -> set:
-    return set(load_json(POSTED_FILE, {"ids": []}).get("ids", []))
- 
- 
-def save_posted_id(news_id: str):
-    ids = load_posted_ids()
+
+
+def load_posted() -> dict:
+    return load_json(POSTED_FILE, {"ids": [], "titles": []})
+
+
+def save_posted(news_id: str, title: str):
+    data = load_posted()
+    ids = set(data.get("ids", []))
     ids.add(news_id)
-    save_json(POSTED_FILE, {"ids": list(ids)[-1000:]})
- 
- 
+    titles = data.get("titles", [])
+    titles.append(title[:100])
+    save_json(POSTED_FILE, {
+        "ids": list(ids)[-1000:],
+        "titles": titles[-RECENT_TITLES_MEMORY:],
+    })
+
+
 def make_news_id(url: str) -> str:
     return hashlib.md5(url.encode("utf-8")).hexdigest()[:16]
- 
- 
+
+
 # ============================================================
-# ПАРСИНГ С ФИЛЬТРОМ СВЕЖЕСТИ
+# ПАРСИНГ НОВОСТЕЙ
 # ============================================================
- 
+
 def fetch_feed_with_ua(url: str):
-    """Парсит RSS с User-Agent (нужно для Reddit, иначе блок)."""
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TelegramAINewsBot/1.0"
         })
         with urllib.request.urlopen(req, timeout=20) as resp:
-            data = resp.read()
-        return feedparser.parse(data)
+            return feedparser.parse(resp.read())
     except Exception as e:
-        logger.warning(f"UA-парсинг не сработал для {url}: {e}, пробую обычный")
+        logger.warning(f"UA-парсинг упал для {url}: {e}")
         try:
             return feedparser.parse(url)
-        except Exception as e2:
-            logger.error(f"И обычный парсинг упал: {e2}")
+        except Exception:
             return None
- 
- 
+
+
 def entry_age_days(entry) -> float | None:
-    """Возраст записи в днях. None если дату не определить."""
     for key in ("published_parsed", "updated_parsed"):
         t = entry.get(key)
         if t:
@@ -147,79 +131,56 @@ def entry_age_days(entry) -> float | None:
             except Exception:
                 continue
     return None
- 
- 
+
+
 def fetch_news() -> list[dict]:
-    posted_ids = load_posted_ids()
+    posted_ids = set(load_posted().get("ids", []))
     all_news = []
- 
     for source_name, rss_url in RSS_SOURCES:
         feed = fetch_feed_with_ua(rss_url)
         if not feed or not feed.entries:
-            logger.info(f"Пусто: {source_name}")
             continue
- 
-        logger.info(f"Парсим {source_name}: {len(feed.entries)} записей")
         for entry in feed.entries[:15]:
             url = entry.get("link", "")
             if not url:
                 continue
- 
             news_id = make_news_id(url)
             if news_id in posted_ids:
                 continue
- 
-            # ФИЛЬТР СВЕЖЕСТИ
             age = entry_age_days(entry)
             if age is not None and age > FRESHNESS_DAYS:
-                continue  # слишком старое
- 
+                continue
             summary = entry.get("summary", "") or entry.get("description", "")
             for tag in ["<p>", "</p>", "<br>", "<br/>", "<div>", "</div>", "<span>", "</span>"]:
                 summary = summary.replace(tag, " ")
- 
-            title = entry.get("title", "").strip()
-            # Reddit-заголовки часто содержат флейр в скобках — оставляем как есть
- 
             all_news.append({
                 "id": news_id,
-                "title": title,
+                "title": entry.get("title", "").strip(),
                 "summary": summary.strip()[:1200],
                 "url": url,
                 "source": source_name,
                 "age_days": round(age, 1) if age is not None else None,
             })
- 
-    logger.info(f"📰 Свежих новостей (до {FRESHNESS_DAYS} дн.): {len(all_news)}")
+    logger.info(f"📰 Свежих новостей: {len(all_news)}")
     return all_news
- 
- 
+
+
 # ============================================================
-# ВЫБОР ЛУЧШЕЙ НОВОСТИ
+# ВЫБОР НОВОСТИ (с анти-повтором тем)
 # ============================================================
- 
-NEWS_SELECTOR_PROMPT = """Ты — главред топового русскоязычного Telegram-канала для AI-креаторов (делают видео, музыку, арт через нейросети).
-Аудитория — практики: работают с Seedance, Kling, Veo, Suno, ElevenLabs, Nano Banana, Seedream и т.д.
- 
-Из списка выбери ОДНУ новость — самую горячую и полезную для этой аудитории ПРЯМО СЕЙЧАС.
- 
-МАКСИМАЛЬНЫЙ ПРИОРИТЕТ:
-- Релизы и крупные обновления генеративных моделей (видео/аудио/изображения)
-- Новые возможности инструментов создателей контента
-- Прорывы: lipsync, длина видео, разрешение, консистентность, скорость, цена
-- Бенчмарки, где модель обошла конкурентов
- 
-НИЗКИЙ ПРИОРИТЕТ (избегай):
-- Корпоративные драмы, инвестиции, увольнения
-- Политика, регуляции, этические споры без продукта
-- Чистая наука без практического применения
-- Мутные слухи без конкретики
- 
-ВАЖНО: если в списке есть свежий релиз модели (Seedance, Kling, Veo, Suno, Nano Banana и подобные) — почти всегда это лучший выбор.
- 
-Ответь ТОЛЬКО номером лучшей новости. Одна цифра, без пояснений."""
- 
- 
+
+NEWS_SELECTOR_PROMPT = """Ты — главред русскоязычного Telegram-канала для AI-креаторов (видео, музыка, арт через нейросети).
+
+Из списка выбери ОДНУ новость — самую горячую и полезную для практиков.
+
+ПРИОРИТЕТ: релизы и обновления генеративных моделей, новые возможности инструментов, прорывы в lipsync/длине/качестве/цене, полезные open-source находки.
+ИЗБЕГАЙ: корпоративные драмы, политика, чистая наука без применения, мутные слухи.
+
+КРИТИЧЕСКИ ВАЖНО — РАЗНООБРАЗИЕ: тебе дадут список недавно опубликованных тем. НЕ выбирай новость, тематически похожую на них. Если про инструмент X недавно был пост — выбери новость про другой инструмент или другую область (звук вместо видео, open-source вместо релизов и т.д.). Разнообразие важнее «горячести».
+
+Ответь ТОЛЬКО номером. Одна цифра, без пояснений."""
+
+
 def select_best_news(news_list: list[dict]) -> dict | None:
     if not news_list:
         return None
@@ -227,191 +188,176 @@ def select_best_news(news_list: list[dict]) -> dict | None:
         return news_list[0]
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        recent = load_posted().get("titles", [])
+        recent_block = "\n".join(f"- {t}" for t in recent) if recent else "(пока пусто)"
         candidates = "\n\n".join([
-            f"[{i+1}] ({n['source']}, {n['age_days']}д назад) {n['title']}\n{n['summary'][:300]}"
+            f"[{i+1}] ({n['source']}, {n['age_days']}д) {n['title']}\n{n['summary'][:250]}"
             for i, n in enumerate(news_list)
         ])
+        msg = f"НЕДАВНО ОПУБЛИКОВАННЫЕ ТЕМЫ (избегай похожих):\n{recent_block}\n\nКАНДИДАТЫ:\n\n{candidates}"
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=10,
+            model=MODEL, max_tokens=10,
             system=NEWS_SELECTOR_PROMPT,
-            messages=[{"role": "user", "content": candidates}],
+            messages=[{"role": "user", "content": msg}],
         )
-        answer = resp.content[0].text.strip()
-        digits = "".join(c for c in answer if c.isdigit())
+        digits = "".join(c for c in resp.content[0].text if c.isdigit())
         if digits:
             idx = int(digits) - 1
             if 0 <= idx < len(news_list):
-                chosen = news_list[idx]
-                logger.info(f"✅ Выбрано #{idx+1}: {chosen['title'][:60]}")
-                return chosen
+                logger.info(f"✅ Выбрано #{idx+1}: {news_list[idx]['title'][:60]}")
+                return news_list[idx]
         return news_list[0]
     except Exception as e:
         logger.error(f"Ошибка выбора: {e}")
         return news_list[0]
- 
- 
-# ============================================================
-# НАПИСАНИЕ ПОСТА — НОВОСТЬ (стиль эксперта)
-# ============================================================
- 
-NEWS_WRITER_PROMPT = """Ты — автор крутого Telegram-канала про AI для создателей контента. Твой стиль — живой, экспертный, с мнением. Не пересказчик новостей, а practitioner, который сам в теме и делится находками.
- 
-ЗАДАЧА: превратить новость в цепляющий пост в стиле топовых AI-каналов.
- 
+
+
+NEWS_WRITER_PROMPT = """Ты — автор Telegram-канала про AI для создателей контента. Стиль — живой, экспертный, с мнением.
+
 СТРУКТУРА:
-1. ЗАГОЛОВОК жирным с эмодзи в начале — ёмкий, кликбейтный но честный. Примеры: "🚀 Seedance 2.5 — это уже перебор (в хорошем смысле)", "🔥 Kling выкатил Turbo и это меняет правила"
-2. ОДНА вводная строка — почему это важно/круто. Цепляет и держит.
-3. БЛОК "Что нового" — 3-5 пунктов через тире, каждый с <b>ключевым словом</b> жирным. Конкретика: цифры, фичи, отличия от прошлой версии.
-4. ТВОЯ ОЦЕНКА — 1-2 предложения личного экспертного взгляда. Что это значит для практика. Где подвох или где реально прорыв. Будь честным — если фича переоценена, скажи.
-5. ФИНАЛ — короткий вывод, прогноз или вопрос к аудитории.
- 
-СТИЛЬ:
-- От первого лица, как эксперт: "Я бы сказал...", "На мой взгляд...", "Это тот случай, когда..."
-- Живой язык, лёгкая дерзость, можно сленг ("выкатили", "имба", "перебор", "разрыв")
-- НО без кринжа и без переигрывания
-- Конкретика вместо воды. Цифры, факты, отличия.
- 
-ЗАПРЕЩЕНО:
-- "Компания X объявила о выпуске" — скучно
-- "В современном мире", "стоит отметить", "важно понимать"
-- Канцелярит и пресс-релизный тон
-- Выдумывать факты которых нет в новости. Если чего-то не знаешь — не пиши.
- 
-ВАЖНО ПРО ТОЧНОСТЬ:
-Опирайся ТОЛЬКО на факты из новости. Не добавляй характеристики, цифры, даты, которых нет в исходнике. Лучше меньше деталей, но правда.
- 
+1. Заголовок жирным с эмодзи в начале — ёмкий, честный
+2. Одна вводная строка — почему это важно
+3. Блок «что нового» — 3-5 пунктов через тире с <b>ключевым словом</b>
+4. Твоя оценка — 1-2 предложения экспертного взгляда, честно (если переоценено — скажи)
+5. Финал — вывод, прогноз или вопрос
+
+СТИЛЬ: от первого лица, живой язык, лёгкая дерзость без кринжа. Конкретика вместо воды.
+ЗАПРЕЩЕНО: «компания объявила», канцелярит, выдумывание фактов которых нет в новости.
 ДЛИНА: до 900 символов.
- 
-HTML: только <b>жирный</b>, <i>курсив</i>, <code>код</code>. Других тегов нет.
- 
-Не добавляй "Источник:" и хэштеги — добавится автоматически."""
- 
- 
+HTML: только <b>, <i>, <code>.
+Не добавляй источник и хэштеги — добавятся автоматически."""
+
+
 def write_news_post(news: dict) -> str | None:
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
-        msg = f"""Напиши пост по этой новости.
- 
-Заголовок: {news['title']}
-Источник: {news['source']}
-Содержание: {news['summary']}
- 
-Помни: только факты из новости, не выдумывай детали."""
+        msg = f"Заголовок: {news['title']}\nИсточник: {news['source']}\nСодержание: {news['summary']}\n\nТолько факты из новости."
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1200,
+            model=MODEL, max_tokens=1200,
             system=NEWS_WRITER_PROMPT,
             messages=[{"role": "user", "content": msg}],
         )
-        text = resp.content[0].text.strip()
-        logger.info(f"✏️ Новостной пост: {len(text)} символов")
-        return text
+        return resp.content[0].text.strip()
     except Exception as e:
         logger.error(f"Ошибка написания новости: {e}")
         return None
- 
- 
+
+
 # ============================================================
-# РУБРИКИ ИЗ БАЗЫ ЗНАНИЙ
+# ДИНАМИЧЕСКИЕ ТЕМЫ С ВЕБ-ПОИСКОМ
 # ============================================================
- 
-def get_topic_from_base(topic_type: str) -> dict | None:
-    topic_dir = CONTENT_DIR / topic_type
-    if not topic_dir.exists():
-        logger.error(f"Нет папки {topic_dir}")
+
+def load_topics() -> list[str]:
+    """Читает topics.txt, отбрасывает комментарии и пустые строки."""
+    if not TOPICS_FILE.exists():
+        logger.error("Нет файла topics.txt")
+        return []
+    lines = TOPICS_FILE.read_text(encoding="utf-8").splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+def pick_topic() -> str | None:
+    """Выбирает случайную неиспользованную тему. Круг пройден — сброс."""
+    topics = load_topics()
+    if not topics:
         return None
-    all_files = sorted([f for f in topic_dir.glob("*.md") if f.is_file()])
-    if not all_files:
-        return None
-    used = load_json(USED_TOPICS_FILE, {}).get(topic_type, [])
-    available = [f for f in all_files if f.name not in used]
+    used_data = load_json(USED_TOPICS_FILE, {})
+    used = set(used_data.get("dynamic_used", []))
+    available = [t for t in topics if t not in used]
     if not available:
-        # круг пройден — сбрасываем
-        used_data = load_json(USED_TOPICS_FILE, {})
-        used_data[topic_type] = []
+        logger.info("♻️ Все темы пройдены — начинаю новый круг (инфа обновится веб-поиском)")
+        used_data["dynamic_used"] = []
         save_json(USED_TOPICS_FILE, used_data)
-        available = all_files
-    chosen = random.choice(available)
-    try:
-        content = chosen.read_text(encoding="utf-8").strip()
-        return {"type": topic_type, "filename": chosen.name, "content": content}
-    except Exception as e:
-        logger.error(f"Не прочитать {chosen}: {e}")
-        return None
- 
- 
-def save_used_topic(topic_type: str, filename: str):
-    used = load_json(USED_TOPICS_FILE, {})
-    used.setdefault(topic_type, []).append(filename)
-    used[topic_type] = used[topic_type][-50:]
-    save_json(USED_TOPICS_FILE, used)
- 
- 
-TOPIC_WRITER_BASE = """Ты — автор Telegram-канала для AI-креаторов. Аудитория делает видео/арт/музыку через нейросети. Не новички, ищут приёмы и инструменты.
- 
-Оформи материал в короткий цепляющий пост.
- 
-ОБЩИЕ ПРАВИЛА:
-- Русский язык, живой тон, лёгкая дерзость
-- Короткие предложения, без воды
-- Максимум 700 символов
-- 1-3 эмодзи
-- Никакого канцелярита: "стоит отметить", "в современном мире" — ЗАПРЕЩЕНО
-- Начинай с крюка
-- НЕ выдумывай факты которых нет в материале
- 
-HTML: <b>жирный</b>, <i>курсив</i>, <code>код</code>. Других тегов нет.
-Не добавляй "Источник:" и хэштеги — добавится автоматически."""
- 
-TOPIC_PROMPTS = {
-    "tools": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ИНСТРУМЕНТ. Расскажи про инструмент: крюк → <b>название</b> → что делает → главная фишка → кому нужно → вывод.",
-    "lifehacks": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ЛАЙФХАК. Дай приём как рецепт: крюк-обещание → <b>суть</b> → шаги → если есть код/промпт выдели <code>...</code> → призыв попробовать.",
-    "learning": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ОБУЧЕНИЕ. Расскажи про ресурс: крюк → <b>название</b> → что внутри → кому подойдёт → что вынесешь.",
-    "production": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ПРОИЗВОДСТВО. Опиши технику/пайплайн: крюк → <b>название</b> → как устроено по шагам → инструменты → типичная ошибка → призыв.",
-    "prompts": TOPIC_WRITER_BASE + "\n\nРУБРИКА: ПРОМПТ. Дай готовый промпт: крюк → для чего → сам промпт в <code>...</code> → для какой нейронки → что важно знать. Можно до 900 символов.",
-    "hidden": TOPIC_WRITER_BASE + "\n\nРУБРИКА: СКРЫТАЯ НЕЙРОНКА. Открой малоизвестный инструмент: крюк-интрига → <b>название</b> → что умеет уникального → чем лучше популярных → где найти.",
-}
- 
- 
-def write_topic_post(topic_type: str, material: str) -> str | None:
+        available = topics
+    return random.choice(available)
+
+
+def mark_topic_used(topic: str):
+    used_data = load_json(USED_TOPICS_FILE, {})
+    used_data.setdefault("dynamic_used", []).append(topic)
+    save_json(USED_TOPICS_FILE, used_data)
+
+
+DYNAMIC_WRITER_PROMPT = """Ты — автор русскоязычного Telegram-канала для AI-креаторов (делают видео, музыку, арт через нейросети). Аудитория — практики, не новички.
+
+ЗАДАЧА: тебе дают тему. Найди через веб-поиск СВЕЖУЮ информацию по ней (актуальное состояние, последние версии, цены, фишки) и напиши цепляющий пост.
+
+ПРАВИЛА ПОИСКА:
+- Ищи актуальную информацию: текущие возможности, свежие обновления, реальные цены
+- Опирайся ТОЛЬКО на найденное. Не выдумывай факты, версии, цифры
+- Если данные противоречат друг другу — бери более свежий источник
+
+СТРУКТУРА ПОСТА:
+1. Крюк — первая строка, цепляет и обещает пользу
+2. <b>Заголовок темы</b>
+3. Суть — конкретные факты, цифры, названия из поиска (3-6 коротких абзацев или пунктов)
+4. Практический вывод — что с этим делать читателю
+5. Финальная фраза или вопрос
+
+СТИЛЬ: живой, от практика, лёгкая дерзость, без канцелярита («стоит отметить» — запрещено). 1-3 эмодзи.
+ДЛИНА: 600-900 символов. Если тема — промпт или инструкция, можно до 1100.
+HTML: только <b>, <i>, <code>. Промпты и параметры оформляй в <code>.
+Не добавляй ссылки, источники и хэштеги — добавятся автоматически.
+
+ВАЖНО: в финальном ответе выдай ТОЛЬКО текст поста. Без преамбул «вот пост», без пояснений."""
+
+
+def write_dynamic_post(topic: str) -> str | None:
+    """Пишет пост по теме, используя веб-поиск для свежих фактов."""
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
-        system = TOPIC_PROMPTS.get(topic_type, TOPIC_WRITER_BASE)
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1100,
-            system=system,
-            messages=[{"role": "user", "content": f"Материал:\n\n{material}"}],
-        )
-        text = resp.content[0].text.strip()
-        logger.info(f"✏️ Рубричный пост: {len(text)} символов")
+        messages = [{"role": "user", "content":
+                     f"Тема поста: {topic}\n\nНайди свежую информацию и напиши пост."}]
+        tools = [{
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": WEB_SEARCH_MAX_USES,
+        }]
+
+        # Цикл на случай pause_turn (поиск может идти в несколько заходов)
+        for _ in range(4):
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=2000,
+                system=DYNAMIC_WRITER_PROMPT,
+                messages=messages,
+                tools=tools,
+            )
+            if resp.stop_reason == "pause_turn":
+                messages.append({"role": "assistant", "content": resp.content})
+                continue
+            break
+
+        text = "".join(
+            block.text for block in resp.content
+            if getattr(block, "type", "") == "text"
+        ).strip()
+
+        if len(text) < 100:
+            logger.warning(f"Слишком короткий результат ({len(text)} симв.)")
+            return None
+        logger.info(f"✏️ Динамический пост: {len(text)} символов")
         return text
     except Exception as e:
-        logger.error(f"Ошибка написания рубрики: {e}")
+        logger.error(f"Ошибка динамического поста: {e}")
         return None
- 
- 
+
+
 # ============================================================
 # ПУБЛИКАЦИЯ
 # ============================================================
- 
-async def publish(text: str, rubric_title: str | None,
-                  source_url: str | None, source_name: str | None) -> bool:
+
+async def publish(text: str, source_url: str | None = None,
+                  source_name: str | None = None) -> bool:
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        parts = []
-        if rubric_title:
-            parts.append(f"<b>{rubric_title}</b>\n")
-        parts.append(text)
+        parts = [text]
         if source_url and source_name:
             parts.append(f"\n🔗 <a href=\"{source_url}\">{source_name}</a>")
         parts.append("\n#нейросети #AI #ИИ")
-        full = "\n".join(parts)
- 
         await bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
-            text=full,
+            text="\n".join(parts),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=False,
         )
@@ -419,56 +365,58 @@ async def publish(text: str, rubric_title: str | None,
         return True
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
-        return False
- 
- 
+        # Запасной вариант: если HTML сломан — публикуем без разметки
+        try:
+            import re
+            plain = re.sub(r"<[^>]+>", "", text)
+            await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=plain)
+            logger.info("✅ Опубликовано без разметки (HTML был сломан)")
+            return True
+        except Exception as e2:
+            logger.error(f"И без разметки не вышло: {e2}")
+            return False
+
+
 # ============================================================
 # ОСНОВНАЯ ЛОГИКА
 # ============================================================
- 
+
 async def do_news() -> bool:
-    """Опубликовать свежую новость. Возвращает True если успешно."""
     news_list = fetch_news()
     if not news_list:
-        logger.warning("Нет свежих новостей")
         return False
-    candidates = news_list[:NEWS_POOL_SIZE]
-    best = select_best_news(candidates)
+    best = select_best_news(news_list[:NEWS_POOL_SIZE])
     if not best:
         return False
     text = write_news_post(best)
     if not text:
         return False
-    ok = await publish(text, None, best["url"], best["source"])
+    ok = await publish(text, best["url"], best["source"])
     if ok:
-        save_posted_id(best["id"])
+        save_posted(best["id"], best["title"])
     return ok
- 
- 
-async def do_topic() -> bool:
-    """Опубликовать рубрику из базы. Возвращает True если успешно."""
-    # Честная ротация: берём следующую рубрику по счётчику, а не по дню.
-    # Счётчик хранится в used_topics.json под ключом "_rotation_index".
-    used = load_json(USED_TOPICS_FILE, {})
-    idx = used.get("_rotation_index", 0)
-    topic_type = TOPIC_ROTATION[idx % len(TOPIC_ROTATION)]
-    used["_rotation_index"] = (idx + 1) % len(TOPIC_ROTATION)
-    save_json(USED_TOPICS_FILE, used)
-    logger.info(f"Рубрика по ротации: {topic_type}")
- 
-    topic = get_topic_from_base(topic_type)
+
+
+async def do_dynamic_topic() -> bool:
+    topic = pick_topic()
     if not topic:
-        logger.warning(f"Нет тем в рубрике {topic_type}")
         return False
-    text = write_topic_post(topic_type, topic["content"])
+    logger.info(f"🎯 Тема дня: {topic}")
+    text = write_dynamic_post(topic)
     if not text:
         return False
-    ok = await publish(text, TOPIC_TITLES[topic_type], None, None)
+    ok = await publish(text)
     if ok:
-        save_used_topic(topic_type, topic["filename"])
+        mark_topic_used(topic)
+        # Тоже запоминаем в анти-повторы новостного селектора
+        data = load_posted()
+        titles = data.get("titles", [])
+        titles.append(topic[:100])
+        data["titles"] = titles[-RECENT_TITLES_MEMORY:]
+        save_json(POSTED_FILE, data)
     return ok
- 
- 
+
+
 async def main():
     missing = [k for k, v in {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
@@ -478,24 +426,20 @@ async def main():
     if missing:
         logger.error(f"Не заданы секреты: {', '.join(missing)}")
         raise SystemExit(1)
- 
-    # ЧЕРЕДОВАНИЕ: чётные дни месяца — новости, нечётные — рубрика
+
     day = datetime.now(TIMEZONE).day
     is_news_day = (day % 2 == 0)
- 
-    logger.info(f"📅 День {day}, режим: {'НОВОСТИ' if is_news_day else 'РУБРИКА'}")
- 
+    logger.info(f"📅 День {day}: {'НОВОСТЬ' if is_news_day else 'ТЕМА С ВЕБ-ПОИСКОМ'}")
+
     if is_news_day:
-        # Новость, с откатом на рубрику если новостей нет
         if not await do_news():
-            logger.info("Новостей нет — публикую рубрику вместо них")
-            await do_topic()
+            logger.info("Новостей нет — пишу тему с веб-поиском")
+            await do_dynamic_topic()
     else:
-        # Рубрика, с откатом на новость если база пуста
-        if not await do_topic():
-            logger.info("База пуста — публикую новость вместо рубрики")
+        if not await do_dynamic_topic():
+            logger.info("Тема не вышла — публикую новость")
             await do_news()
- 
- 
+
+
 if __name__ == "__main__":
     asyncio.run(main())
