@@ -29,5 +29,8 @@
     "02_lipsync_workflow.md",
     "04_storyboard.md"
   ],
-  "_rotation_index": 0
+  "_rotation_index": 0,
+  "dynamic_used": [
+    "Как продлить AI-видео дольше лимита одной генерации"
+  ]
 }
