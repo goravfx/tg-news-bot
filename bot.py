@@ -263,6 +263,84 @@ def clean_post(text: str | None) -> str | None:
     return t
 
 
+# ============================================================
+# ПРОВЕРКА ЦЕЛОСТНОСТИ ПОСТА
+# ============================================================
+# Если ответ модели обрезался по лимиту токенов, пост уходит в канал
+# огрызком с незакрытым тегом. Telegram такую разметку отвергает,
+# и раньше срабатывал аварийный фолбэк, публикуя обрубок без разметки.
+# Теперь: чиним разметку, а обрубки не публикуем вовсе.
+
+ALLOWED_TAGS = {"b", "i", "u", "s", "code", "pre", "a"}
+TAG_RE = re.compile(r"<(/?)([a-zA-Z]+)([^>]*)>")
+MIN_POST_LEN = 220          # короче — почти наверняка обрубок
+SENTENCE_END = ".!?)»\"'…" + "”"
+
+
+def sanitize_html(text: str) -> str:
+    """Убирает неподдерживаемые теги и закрывает незакрытые."""
+    stack = []
+    out = []
+    pos = 0
+    for m in TAG_RE.finditer(text):
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        closing, name, attrs = m.group(1), m.group(2).lower(), m.group(3)
+        if name not in ALLOWED_TAGS:
+            continue                      # неподдерживаемый тег просто выкидываем
+        if closing:
+            if name in stack:
+                # закрываем всё, что открыто позже
+                while stack and stack[-1] != name:
+                    out.append(f"</{stack.pop()}>")
+                stack.pop()
+                out.append(f"</{name}>")
+        else:
+            stack.append(name)
+            out.append(f"<{name}{attrs}>")
+    out.append(text[pos:])
+    while stack:                          # дозакрываем висящие теги
+        out.append(f"</{stack.pop()}>")
+    return "".join(out)
+
+
+def looks_truncated(text: str) -> bool:
+    """Похоже ли, что текст оборвался на полуслове."""
+    t = text.rstrip()
+    if not t:
+        return True
+    if t.endswith("<") or t.count("<") != t.count(">"):
+        return True
+    last = t.splitlines()[-1].strip()
+    last_clean = re.sub(r"<[^>]+>", "", last).strip()
+    if not last_clean:
+        return False
+    # Последняя строка без завершающего знака и не похожа на пункт списка
+    if last_clean[-1] not in SENTENCE_END:
+        if last_clean.startswith(("—", "-", "•", "*")):
+            return False                  # пункт списка без точки — нормально
+        if len(last_clean.split()) >= 3:  # оборванная фраза
+            return True
+    return False
+
+
+def validate_post(text: str | None) -> str | None:
+    """Финальный контроль качества перед публикацией."""
+    if not text:
+        return None
+    t = sanitize_html(text).strip()
+    if len(t) < MIN_POST_LEN:
+        logger.warning(f"❌ Пост слишком короткий ({len(t)} симв.) — не публикую")
+        return None
+    if looks_truncated(t):
+        logger.warning("❌ Пост выглядит оборванным — не публикую")
+        return None
+    if len([l for l in t.splitlines() if l.strip()]) < 3:
+        logger.warning("❌ В посте меньше трёх строк — похоже на обрубок")
+        return None
+    return t
+
+
 def fetch_news() -> tuple[list[dict], dict]:
     """Возвращает (новости, диагностика)."""
     posted_ids = set(load_posted().get("ids", []))
@@ -443,11 +521,14 @@ def write_news_post(news: dict) -> str | None:
         msg = (f"Заголовок: {news['title']}\nИсточник: {news['source']}\n"
                f"Содержание: {news['summary']}\n\nТолько факты из новости, ничего не выдумывай.")
         resp = client.messages.create(
-            model=MODEL, max_tokens=1200,
+            model=MODEL, max_tokens=2000,
             system=NEWS_WRITER_PROMPT,
             messages=[{"role": "user", "content": msg}],
         )
-        return clean_post(resp.content[0].text)
+        if resp.stop_reason == "max_tokens":
+            logger.warning("❌ Ответ обрезан лимитом токенов — пост не публикую")
+            return None
+        return validate_post(clean_post(resp.content[0].text))
     except Exception as e:
         logger.error(f"Ошибка написания новости: {e}")
         return None
@@ -549,7 +630,7 @@ def _write_with_search(system: str, user: str) -> str | None:
         resp = None
         for _ in range(4):
             resp = client.messages.create(
-                model=MODEL, max_tokens=2000,
+                model=MODEL, max_tokens=3500,
                 system=system, messages=messages, tools=tools,
             )
             if resp.stop_reason == "pause_turn":
@@ -559,6 +640,10 @@ def _write_with_search(system: str, user: str) -> str | None:
         # Между поисками модель комментирует свои действия отдельными
         # текстовыми блоками. Пост — всегда в ПОСЛЕДНЕМ блоке, поэтому
         # склеивать все нельзя: болтовня попадёт в канал.
+        if resp.stop_reason == "max_tokens":
+            logger.warning("❌ Ответ обрезан лимитом токенов — пост не публикую")
+            return None
+
         text_blocks = [b.text for b in resp.content
                        if getattr(b, "type", "") == "text" and b.text.strip()]
         if not text_blocks:
@@ -571,7 +656,7 @@ def _write_with_search(system: str, user: str) -> str | None:
         tagged = [b for b in text_blocks if "<post>" in b.lower()]
         raw = tagged[-1] if tagged else text_blocks[-1]
 
-        text = clean_post(raw)
+        text = validate_post(clean_post(raw))
         if not text:
             return None
         logger.info(f"✏️ Пост с поиском: {len(text)} символов")
@@ -592,7 +677,7 @@ async def publish(text: str, source_url: str | None = None,
     if source_url and source_name:
         parts.append(f"\n🔗 <a href=\"{source_url}\">{source_name}</a>")
     parts.append("\n#нейросети #AI #ИИ")
-    full = "\n".join(parts)
+    full = sanitize_html("\n".join(parts))
     try:
         await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=full,
                                parse_mode=ParseMode.HTML, disable_web_page_preview=False)
@@ -600,9 +685,11 @@ async def publish(text: str, source_url: str | None = None,
         return True
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
+        # Фолбэк без разметки допустим ТОЛЬКО потому, что текст уже прошёл
+        # validate_post: обрубки и битые посты сюда не доходят.
         try:
             await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=strip_html(full))
-            logger.info("✅ Опубликовано без разметки")
+            logger.warning("⚠️ Опубликовано без разметки — проверь пост глазами")
             return True
         except Exception as e2:
             logger.error(f"И без разметки не вышло: {e2}")
