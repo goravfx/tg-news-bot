@@ -66,7 +66,6 @@
     "f04b5b1c9763fee1"
   ],
   "titles": [
-    "Clean Plate IC-LoRA for LTX-2.3 removes people, pedestrians, and vehicles from a clip and rebuilds t",
     "Как получить консистентного персонажа в AI-видео между сценами",
     "Runway launches AI model router as generative media gets crowded",
     "Open-source модели против платных сервисов: честное сравнение",
@@ -85,6 +84,7 @@
     "Голосовой ввод в любое окно Windows за секунду. Офлайн, на CPU, без единого гигабайта torch",
     "Show HN: Vibez – Open-Source Rust Based Digital Audio Workstation (DAW)",
     "Build Low-Latency Multilingual Voice Agents: Open Weights & Full Deployment Control with NVIDIA Magpie TTS",
-    "Show HN: Autoclipper – Convert 1 long video in many short clips"
+    "Show HN: Autoclipper – Convert 1 long video in many short clips",
+    "тихие изменения цен и лимитов"
   ]
 }
