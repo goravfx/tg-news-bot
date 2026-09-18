@@ -99,7 +99,6 @@
     "ea47779cf70de2c3"
   ],
   "titles": [
-    "Как получить один и тот же персонаж в серии картинок",
     "Show HN: Hillock: Local neuro-symbolic memory engine in <1.2GB VRAM",
     "Show HN: Transform text and images into cinematic AI videos",
     "Переводим книги нейронками для себя: год спустя. Словари, скорости и почему переводчики всё ещё нужны",
@@ -118,6 +117,7 @@
     "Show HN: Build2me – Prove2Me for software agent swarms build code",
     "Система экстренных оповещений на 15 тысяч пользователей: LLM, PostGIS, Qdrant и Telegram",
     "Show HN: Friday – Self-hosted persistent memory for AI coding agents (MCP)",
-    "Не бенчмарком единым: стелс-модель union-alpha на реальной задаче — сутки от релиза до боя"
+    "Не бенчмарком единым: стелс-модель union-alpha на реальной задаче — сутки от релиза до боя",
+    "тихие изменения цен и лимитов"
   ]
 }
