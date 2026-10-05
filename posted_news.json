@@ -114,7 +114,6 @@
     "5b6afa769aecbff7"
   ],
   "titles": [
-    "Система экстренных оповещений на 15 тысяч пользователей: LLM, PostGIS, Qdrant и Telegram",
     "Show HN: Friday – Self-hosted persistent memory for AI coding agents (MCP)",
     "Не бенчмарком единым: стелс-модель union-alpha на реальной задаче — сутки от релиза до боя",
     "тихие изменения цен и лимитов",
@@ -133,6 +132,7 @@
     "Show HN: Paper(Local CLI for Agent Debugging)",
     "Show HN: pi pod – run your pi coding agent in sandboxes on your own server",
     "Show HN: RepoGuard – Architecture linter for AI-generated code (Cursor, Claude)",
-    "Run Qwen 3.8 Flash Next (125B) on consumer hardware (RTX 4090) at 100T/s"
+    "Run Qwen 3.8 Flash Next (125B) on consumer hardware (RTX 4090) at 100T/s",
+    "тихие изменения цен и лимитов"
   ]
 }
