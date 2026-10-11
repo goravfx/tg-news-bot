@@ -119,7 +119,6 @@
     "f2854f03e1106e55"
   ],
   "titles": [
-    "Локальный инференс на Ryzen AI Halo",
     "Show HN: Lightdrift / Image search for AI agents through API and MCP",
     "Show HN: Meeting Recording and Transcription for Agents",
     "Show HN: IttyBittyAI – Qwen2.5:0.5B running on a 2017 Asus smartphone",
@@ -138,6 +137,7 @@
     "Show HN: Lessong - Turn any song into a language lesson",
     "Сколько времени нужно непрограммисту, чтобы сделать приложение с сервером, офлайн‑режимом и SEO",
     "Show HN: CAD Studio – Describe a part, get parametric CAD you can print (macOS)",
-    "Show HN: Eval-skills for automatic agent improvement"
+    "Show HN: Eval-skills for automatic agent improvement",
+    "Организация проекта: как хранить промпты, сиды и версии генераций"
   ]
 }
